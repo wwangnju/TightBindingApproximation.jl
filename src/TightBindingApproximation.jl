@@ -393,11 +393,11 @@ end
 @inline initialize(eb::EnergyBands{P, <:AbstractVector{Int}}, ::AbstractTBA) where P = (eb.reciprocalspace, zeros(Float64, length(eb.reciprocalspace), length(eb.bands)))
 @inline Base.nameof(tba::Algorithm{<:AbstractTBA}, eb::Assignment{<:EnergyBands}) = @sprintf "%s_%s" repr(tba, ∉(names(eb.action.reciprocalspace))) eb.id
 function run!(tba::Algorithm{<:AbstractTBA}, eb::Assignment{<:EnergyBands})
-    atol = get(eb.action.options, :atol, 10^-12)
+    imagtol = get(eb.action.options, :imagtol, 10^-12)
     for (i, params) in enumerate(pairs(eb.action.reciprocalspace))
         update!(tba; params...)
         eigenvalues = eigvals(tba; params..., eb.action.options...)[eb.action.bands]
-        @assert norm(imag(eigenvalues))<atol "run! error: imaginary eigen energies at $(params) with the norm of all imaginary parts being $(norm(imag(eigenvalues)))."
+        @warn norm(imag(eigenvalues))<imagtol "run! error: imaginary eigen energies at $(params) with the norm of all imaginary parts being $(norm(imag(eigenvalues)))."
         eb.data[2][i, :] = real(eigenvalues)
     end
 end
