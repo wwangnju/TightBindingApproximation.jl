@@ -18,11 +18,11 @@ using TimerOutputs: TimerOutput, @timeit_debug
 import LinearAlgebra: eigen, eigvals, eigvecs, ishermitian
 import QuantumLattices: add!, dimension, kind, matrix, update!
 import QuantumLattices: initialize, run!
-import QuantumLattices: contentnames
+import QuantumLattices: contentnames, ticks, distance
 
 export Bosonic, Fermionic, Phononic, TBAKind
 export AbstractTBA, TBA, TBAMatrix, TBAMatrixRepresentation, commutator
-export BerryCurvature, DensityOfStates, EnergyBands, FermiSurface, InelasticNeutronScatteringSpectra, Kubo, Fukui, BerryCurvatureMethod
+export BerryCurvature, DensityOfStates, EnergyBands, FermiSurface, InelasticNeutronScatteringSpectra, Kubo, Fukui, BerryCurvatureMethod, ProjectedEnergyBands
 export SampleNode, deviation, optimize!
 
 const tbatimer = TimerOutput()
@@ -393,11 +393,11 @@ end
 @inline initialize(eb::EnergyBands{P, <:AbstractVector{Int}}, ::AbstractTBA) where P = (eb.reciprocalspace, zeros(Float64, length(eb.reciprocalspace), length(eb.bands)))
 @inline Base.nameof(tba::Algorithm{<:AbstractTBA}, eb::Assignment{<:EnergyBands}) = @sprintf "%s_%s" repr(tba, ∉(names(eb.action.reciprocalspace))) eb.id
 function run!(tba::Algorithm{<:AbstractTBA}, eb::Assignment{<:EnergyBands})
-    imagtol = get(eb.action.options, :imagtol, 10^-12)
+    imagtol = get(eb.action.options, :imagtol, 10^-9)
     for (i, params) in enumerate(pairs(eb.action.reciprocalspace))
         update!(tba; params...)
         eigenvalues = eigvals(tba; params..., eb.action.options...)[eb.action.bands]
-        @warn norm(imag(eigenvalues))<imagtol "run! error: imaginary eigen energies at $(params) with the norm of all imaginary parts being $(norm(imag(eigenvalues)))."
+        @assert norm(imag(eigenvalues))<imagtol "run! error: imaginary eigen energies at $(params) with the norm of all imaginary parts being $(norm(imag(eigenvalues)))."
         eb.data[2][i, :] = real(eigenvalues)
     end
 end
@@ -721,6 +721,54 @@ function run!(tba::Algorithm{<:AbstractTBA{<:Fermionic{:TBA}}}, dos::Assignment{
             end
         end
     end
+end
+
+struct ProjectedEnergyBands{P, A<:Union{Colon, AbstractVector{Int}}, L<:Tuple{Vararg{Union{Colon, AbstractVector{Int}}}}, O} <: Action
+    reciprocalspace::P
+    bands::A
+    orbitals::L
+    options::O
+end
+@inline ProjectedEnergyBands(reciprocalspace, bands::Union{Colon, AbstractVector{Int}}=:, orbitals::Union{Colon, AbstractVector{Int}}...=:; options...) = ProjectedEnergyBands(reciprocalspace, bands, orbitals, options)
+@inline function initialize(pdos::ProjectedEnergyBands{P, <:AbstractVector{Int}}, ::AbstractTBA) where P
+    return (pdos.reciprocalspace, zeros(Float64, length(pdos.reciprocalspace), length(pdos.bands), length(pdos.orbitals) + 1))
+end
+@inline function initialize(pdos::ProjectedEnergyBands{P, Colon}, tba::AbstractTBA) where P
+    return (pdos.reciprocalspace, zeros(Float64, length(pdos.reciprocalspace), dimension(tba), length(pdos.orbitals) + 1))
+end
+
+function run!(tba::Algorithm{<:AbstractTBA{<:Fermionic{:TBA}}}, pdos::Assignment{<:ProjectedEnergyBands})
+    for (i, momentum) in enumerate(pdos.action.reciprocalspace)
+        eigensystem = eigen(tba; k=momentum)
+        values, vectors = eigensystem.values[pdos.action.bands], eigensystem.vectors[:, pdos.action.bands]
+        for (j, value) in enumerate(values)
+            pdos.data[2][i, j, 1] = value
+            for (l, orbitals) in enumerate(pdos.action.orbitals)
+                factor = mapreduce(abs2, +, vectors[orbitals, j])
+                pdos.data[2][i, j, l+1] = factor
+            end
+        end
+    end    
+end
+
+@recipe function plot(pack::Tuple{Algorithm{<:AbstractTBA}, Assignment{<:ProjectedEnergyBands}})
+    path = pack[2].data[1]
+    seriestype --> :scatter
+    titlefontsize --> 10
+    legend --> false
+    minorgrid --> true
+    xminorticks --> 10
+    yminorticks --> 10
+    xticks --> ticks(path)
+    xlabel --> string(names(path)[1])
+    markeralpha --> 0.50
+    markercolor --> :white
+    markerstrokealpha --> 0.0
+    for i in 1:size(pack[2].data[2], 3)
+        markerstrokecolor --> i
+        markersize --> pack[2].data[2][:, :, i]      
+    end
+    [distance(path, j) for j=1:length(path)], pack[2].data[2][:, :, 1] 
 end
 
 """
