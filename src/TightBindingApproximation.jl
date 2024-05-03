@@ -353,21 +353,20 @@ end
 @inline contentnames(::Type{<:TBA}) = (:lattice, :H, :commutator)
 
 """
-    TBA(lattice::AbstractLattice, hilbert::Hilbert, terms::Term...; neighbors::Union{Nothing, Int, Neighbors}=nothing, boundary::Boundary=plain)
-    TBA(lattice::AbstractLattice, hilbert::Hilbert, terms::Tuple{Vararg{Term}}; neighbors::Union{Nothing, Int, Neighbors}=nothing, boundary::Boundary=plain)
+    TBA(lattice::AbstractLattice, hilbert::Hilbert, terms::Union{Term, Tuple{Term, Vararg{Term}}}, boundary::Boundary=plain; neighbors::Union{Nothing, Int, Neighbors}=nothing)
 
 Construct a tight-binding quantum lattice system.
 """
-@inline function TBA(lattice::AbstractLattice, hilbert::Hilbert, terms::Term...; neighbors::Union{Nothing, Int, Neighbors}=nothing, boundary::Boundary=plain)
-    return TBA(lattice, hilbert, terms; neighbors=neighbors, boundary=boundary)
-end
-@inline function TBA(lattice::AbstractLattice, hilbert::Hilbert, terms::Tuple{Vararg{Term}}; neighbors::Union{Nothing, Int, Neighbors}=nothing, boundary::Boundary=plain)
+@inline function TBA(lattice::AbstractLattice, hilbert::Hilbert, terms::Union{Term, Tuple{Term, Vararg{Term}}}, boundary::Boundary=plain; neighbors::Union{Nothing, Int, Neighbors}=nothing)
+    terms = wrapper(terms)
     tbakind = TBAKind(typeof(terms), valtype(hilbert))
     table = Table(hilbert, Metric(tbakind, hilbert))
     commt = commutator(tbakind, hilbert)
     isnothing(neighbors) && (neighbors = maximum(term->term.bondkind, terms))
-    return TBA{typeof(tbakind)}(lattice, OperatorGenerator(terms, bonds(lattice, neighbors), hilbert; half=false, table=table, boundary=boundary), commt)
+    return TBA{typeof(tbakind)}(lattice, OperatorGenerator(terms, bonds(lattice, neighbors), hilbert, boundary, table; half=false), commt)
 end
+@inline wrapper(x) = (x,)
+@inline wrapper(xs::Tuple) = xs
 
 """
     TBA{K}(lattice::AbstractLattice, hamiltonian::Function, parameters::Parameters, commt::Union{AbstractMatrix, Nothing}=nothing) where {K<:TBAKind}
@@ -407,6 +406,7 @@ end
 Abstract type for calculation of Berry curvature.
 """
 abstract type BerryCurvatureMethod end
+
 """
     Fukui <: BerryCurvatureMethod
 
@@ -423,19 +423,20 @@ struct Fukui <: BerryCurvatureMethod
     abelian::Bool
 end
 @inline Fukui(bands::AbstractVector{Int}; abelian::Bool=true) = Fukui(collect(bands), abelian)
+
 """
-    Kubo{K<:Union{Nothing, Vector{Float64}}} <: BerryCurvatureMethod 
+    Kubo{K<:Union{Nothing, Vector{Float64}}} <: BerryCurvatureMethod
     
-Kubo method to calculate the total Berry curvature of occupied energy bands. The Kubo formula is given by 
+Kubo method to calculate the total Berry curvature of occupied energy bands. The Kubo formula is given by
 ```math
 \\Omega_{ij}(\\bm k)=\\epsilon_{ijl}\\sum_{n}f(\\epsilon_n(\\bm k))b_n^l(\\bm k)=-2{\\rm Im}\\sum_v\\sum_c{V_{vc,i}(\\bm k)V_{cv,j}(\\bm k)\\over [\\omega_c(\\bm k)-\\omega_v(\\bm k)]^2},
 ```
-where 
+where
 ```math
  V_{cv,j}={\\langle u_{c\\bm k}|{\\partial H\\over \\partial {\\bm k}_j}|u_{v\\bm k}\\rangle}
-``` 
+```
 v and c subscripts denote valence (occupied) and conduction (unoccupied) bands, respectively.
-Hall conductivity in 2D space is given by 
+Hall conductivity in 2D space is given by
 ```math
 \\sigma_{xy}=-{e^2\\over h}\\int_{BZ}{dk_x dk_y\\over 2\\pi}{\\Omega_{xy}}
 ```
@@ -447,6 +448,7 @@ struct Kubo{K<:Union{Nothing, Vector{Float64}}} <: BerryCurvatureMethod
     ky::K
 end
 @inline Kubo(μ::Real; d::Float64=0.1, kx::T=nothing, ky::T=nothing) where {T<:Union{Nothing, Vector{Float64}}} = Kubo(convert(Float64, μ), d, kx, ky)
+
 """
     BerryCurvature{B<:ReciprocalSpace, M<:BerryCurvatureMethod, O} <: Action
 
@@ -496,6 +498,7 @@ function eigvecs(tba::Algorithm{<:AbstractTBA}, bc::Assignment{<:BerryCurvature{
     end
     return result
 end
+
 # For the Berry curvature and Berry phase (÷2π) on the Brillouin zone or reciprocal zone.
 @inline function initialize(bc::BerryCurvature{<:Union{ReciprocalZone, BrillouinZone}, <:Kubo}, ::AbstractTBA)
     @assert length(bc.reciprocalspace.reciprocals)==2 "initialize error: Berry curvature should be defined for 2d systems."
@@ -504,6 +507,7 @@ end
     n = zeros(1)
     return (bc.reciprocalspace, z, n)
 end
+
 # For the Berry curvature on a specific path in the reciprocal space.
 @inline function initialize(bc::BerryCurvature{<:ReciprocalPath, <:Kubo}, ::AbstractTBA)
     np = length(bc.reciprocalspace)
@@ -544,7 +548,7 @@ function _kubo(tba::Algorithm{<:AbstractTBA},  bc::Assignment{<:BerryCurvature{<
             vs₁ = eigensystem.vectors[:, i]
             for (j, valc) in enumerate(eigensystem.values)
                 valc < μ && continue
-                vs₂ = eigensystem.vectors[:, j] 
+                vs₂ = eigensystem.vectors[:, j]
                 velocity_x = vs₁'*dHx*vs₂
                 velocity_y = vs₂'*dHy*vs₁
                 res += -2*imag(velocity_x*velocity_y/(valc-valv)^2)
@@ -591,7 +595,7 @@ function run!(tba::Algorithm{<:AbstractTBA}, bc::Assignment{<:BerryCurvature})
                 bc.data[2][j, i, 1] = -imag(logdet(p₁*p₂*p₃*p₄))/area
                 length(bc.data)==3 && (bc.data[3][1] += bc.data[2][j, i, 1]*area/2pi)
             end
-            @warn "This method (nonabelian case for `Fukui` method) is not verified in bosonic system."
+            @warn "This method (non-abelian case for `Fukui` method) is not verified in bosonic system."
         end
     else isa(alg, Kubo)
         Ωxys = _kubo(tba, bc)
