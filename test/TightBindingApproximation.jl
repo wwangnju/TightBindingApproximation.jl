@@ -287,6 +287,27 @@ end
     Makie.save("MakieDensityOfStates.png", Makie.plot(dos))
     @test isapprox(sum(dos.data.values[:, 1]), 2.0; atol=10^-3)
 
+    # Test fermi_dirac, occupation, chemical_potential
+    @test fermi_dirac(-1.0, 0.0, 0.0) == 1.0
+    @test fermi_dirac( 1.0, 0.0, 0.0) == 0.0
+    @test fermi_dirac( 0.0, 0.0, 0.0) == 1.0
+    @test isapprox(fermi_dirac(0.0, 0.0, 1.0), 0.5; atol=1e-10)
+    @test isapprox(fermi_dirac(100.0, 0.0, 1e-10), 0.0; atol=1e-10)
+
+    # occupation: dos.values has columns (total, spin_up, spin_down)
+    n_full = occupation(dos.data, 100.0, 0.0)
+    @test isapprox(n_full[1], 2.0; atol=0.05)   # total, fully occupied
+    @test isapprox(n_full[2], 1.0; atol=0.05)   # spin up
+
+    n_empty = occupation(dos.data, -100.0, 0.0)
+    @test isapprox(n_empty[1], 0.0; atol=0.01)  # total, empty
+
+    # chemical_potential with total DOS (orbitals=:)
+    dos_tot = tba(:DensityOfStates_total, DensityOfStates(brillouin))
+    μ = chemical_potential(dos_tot.data, 1.0; T=0.0)
+    n_half = occupation(dos_tot.data, μ, 0.0)
+    @test isapprox(n_half[1], 1.0; atol=0.05)
+
     reciprocalzone = ReciprocalZone(unitcell, [-1.0=>1.0, -1.0=>1.0]; length=401, ends=(true, true))
     Plots.savefig(Plots.plot(tba(:FermiSurfaceExtended, FermiSurface(reciprocalzone, 0.0))), "PlotsFermiSurfaceExtended.png")
     Makie.save("MakieFermiSurfaceExtended.png", Makie.plot(tba(:FermiSurfaceExtended, FermiSurface(reciprocalzone, 0.0))))
@@ -407,4 +428,90 @@ const dir = Pkg.Artifacts.ensure_artifact_installed("WannierDataSets", toml)
     Makie.plot!(ax, bands[1], bands[2]; color=:green, alpha=0.6, linewidth=2.5)
     Makie.plot!(ax, tba(:EB, EnergyBands(path)); color=:black)
     Makie.save("MakieSiliconOperatorizationSpinful.png", fig)
+
+    @testset "choosehamiltonian" begin
+        ham = wan.frontend.H
+        lat = wan.frontend.lattice
+        cnt = wan.frontend.centers
+
+        # No filters: should not lose any R-vector
+        result = choosehamiltonian(ham, lat, cnt)
+        @test length(result.operators) == length(ham.operators)
+
+        # min_hopping_norm filter
+        result = choosehamiltonian(ham, lat, cnt; min_hopping_norm=0.01)
+        @test length(result.operators) <= length(ham.operators)
+
+        # max_distance filter
+        result = choosehamiltonian(ham, lat, cnt; max_distance=5.0)
+        @test length(result.operators) <= length(ham.operators)
+
+        # Combined filters
+        result = choosehamiltonian(ham, lat, cnt; min_hopping_norm=0.001, max_distance=8.0)
+
+        # Result is usable to construct W90
+        filtered_wan = W90(lat, cnt, result)
+        @test dimension(filtered_wan) == dimension(wan.frontend)
+
+        # Filtered result structural correctness
+        for m in result.operators
+            @test size(m.value) == size(first(ham).value)
+            @test m.id isa NTuple{3, Int}
+        end
+    end
+
+    @testset "distancehamiltonian" begin
+        ham = wan.frontend.H
+        lat = wan.frontend.lattice
+        cnt = wan.frontend.centers
+
+        dists, idxs, vals = distancehamiltonian(ham, lat, cnt)
+        @test length(dists) == length(idxs) == length(vals)
+        @test all(d -> d >= 0.0, dists)
+        @test all(v -> v >= 0.0, vals)
+        @test length(dists) > 0
+        for (R, i, j) in idxs
+            @test R isa NTuple{3, Int}
+            @test 1 <= i <= size(cnt, 2)
+            @test 1 <= j <= size(cnt, 2)
+        end
+    end
+
+    @testset "showhamiltonian" begin
+        ham = wan.frontend.H
+        lat = wan.frontend.lattice
+        cnt = wan.frontend.centers
+        nsublattice = size(lat.coordinates, 2)  # number of sites in the unit cell
+
+        io = IOBuffer()
+        showhamiltonian(io, ham, lat, cnt, nsublattice)
+        output = String(take!(io))
+        @test length(output) > 0
+        @test occursin(", distance=", output)
+        @test occursin("R=(", output)
+
+        # Write to file
+        tmpfile = tempname() * ".txt"
+        showhamiltonian(tmpfile, ham, lat, cnt, nsublattice)
+        @test isfile(tmpfile)
+        file_output = read(tmpfile, String)
+        @test occursin(", distance=", file_output)
+        rm(tmpfile)
+    end
+
+    @testset "showW90" begin
+        nsublattice = size(wan.frontend.lattice.coordinates, 2)  # number of sites in the unit cell
+        io = IOBuffer()
+        showW90(io, wan.frontend, nsublattice)
+        output = String(take!(io))
+        @test length(output) > 0
+        @test occursin(", distance=", output)
+
+        tmpfile = tempname() * ".txt"
+        showW90(tmpfile, wan.frontend, nsublattice)
+        @test isfile(tmpfile)
+        file_output = read(tmpfile, String)
+        @test occursin(", distance=", file_output)
+        rm(tmpfile)
+    end
 end

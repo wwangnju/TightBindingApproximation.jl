@@ -1,7 +1,7 @@
 module Wannier90
 
 using DelimitedFiles: readdlm
-using LinearAlgebra: Hermitian, dot
+using LinearAlgebra: Hermitian, dot, norm
 using QuantumLattices: CoordinatedIndex, FockIndex, Hilbert, Index, Lattice, LinearTransformation, Matrixization, Operator, OperatorIndexToTuple, OperatorPack, Operators, OperatorSet, OperatorSum, ReciprocalPath, StaticGenerator, Table
 using QuantumLattices: 𝕔, 𝕔⁺
 using StaticArrays: SVector
@@ -10,7 +10,7 @@ using ..TightBindingApproximation: Fermionic, Quadraticization, TBAMatrix
 import QuantumLattices: Algorithm, add!, dimension, matrix
 import ..TightBindingApproximation: TBA
 
-export Operatorization, W90, W90Hoppings, W90Matrixization, findblock, readbands, readcenters, readhamiltonian, readlattice, readpath
+export Operatorization, W90, W90Hoppings, W90Matrixization, choosehamiltonian, distancehamiltonian, showW90, showhamiltonian, findblock, readbands, readcenters, readhamiltonian, readlattice, readpath
 
 """
     findblock(name::String, content::String) -> Union{Nothing, Vector{SubString{String}}}
@@ -190,6 +190,292 @@ function readhamiltonian(path::AbstractString, seedname::AbstractString)
 end
 
 """
+    choosehamiltonian(
+        ham::StaticGenerator{OperatorSum{W90Hoppings, NTuple{3, Int}}},
+        lattice::Lattice,
+        centers::Matrix{Float64};
+        min_hopping_norm::Real = 0.0,
+        max_hopping_norm::Union{Real, Nothing} = nothing,
+        max_distance::Union{Real, Nothing} = nothing,
+        min_distance::Union{Real, Nothing} = nothing
+    ) -> StaticGenerator{OperatorSum{W90Hoppings, NTuple{3, Int}}}
+
+Select Wannier90 hopping amplitudes that satisfy distance and/or hopping norm thresholds.
+
+For each (R, i, j) triplet, the Cartesian distance is `norm(R_cart + centers[:, j] - centers[:, i])`
+where `R_cart = Σ vectors × R`. Returns a new Hamiltonian containing only entries that pass all
+active filters.
+
+This is one of the diagnostic tools that can be used to help in determining
+`min_hopping_norm` and `max_distance` for the tight-binding model.
+
+# Keyword Arguments
+- `min_hopping_norm::Real = 0.0`: minimum |value| to keep.
+- `max_hopping_norm::Union{Real, Nothing} = nothing`: maximum |value| to keep.
+- `min_distance::Union{Real, Nothing} = nothing`: minimum Cartesian distance to keep.
+- `max_distance::Union{Real, Nothing} = nothing`: maximum Cartesian distance to keep.
+"""
+function choosehamiltonian(
+    ham::StaticGenerator{OperatorSum{W90Hoppings, NTuple{3, Int}}},
+    lattice::Lattice,
+    centers::Matrix{Float64};
+    min_hopping_norm::Real = 0.0,
+    max_hopping_norm::Union{Real, Nothing} = nothing,
+    max_distance::Union{Real, Nothing} = nothing,
+    min_distance::Union{Real, Nothing} = nothing
+)
+    n_wan = size(centers, 2)
+    @assert size(centers, 1) == 3 "choosehamiltonian error: centers must have 3 rows."
+    @assert n_wan == size(first(ham).value, 1) "choosehamiltonian error: mismatched sizes of centers and hopping matrices."
+
+    vectors = lattice.vectors
+    filtered = OperatorSum{W90Hoppings}()
+
+    for m in ham.operators
+        R = m.id
+        R_cart = mapreduce(*, +, vectors, R)
+
+        new_value = zeros(ComplexF64, n_wan, n_wan)
+        has_entry = false
+
+        for j in 1:n_wan
+            cⱼ = SVector(centers[1, j], centers[2, j], centers[3, j])
+            for i in 1:n_wan
+                val = m.value[i, j]
+                abs_val = abs(val)
+
+                # Hopping norm filters
+                abs_val < min_hopping_norm && continue
+                !isnothing(max_hopping_norm) && abs_val > max_hopping_norm && continue
+
+                # Distance filters
+                cᵢ = SVector(centers[1, i], centers[2, i], centers[3, i])
+                dist = norm(R_cart + cⱼ - cᵢ)
+                !isnothing(min_distance) && dist < min_distance && continue
+                !isnothing(max_distance) && dist > max_distance && continue
+
+                new_value[i, j] = val
+                has_entry = true
+            end
+        end
+
+        if has_entry
+            filtered.contents[R] = W90Hoppings(new_value, R)
+        end
+    end
+
+    return StaticGenerator(filtered)
+end
+
+"""
+    distancehamiltonian(
+        ham::StaticGenerator{OperatorSum{W90Hoppings, NTuple{3, Int}}},
+        lattice::Lattice,
+        centers::Matrix{Float64}
+    ) -> (Vector{Float64}, Vector{Tuple{NTuple{3, Int}, Int, Int}}, Vector{Float64})
+
+Return all hopping terms with their Cartesian distances and indices for diagnostic purposes.
+
+For well localized Wannier functions, the hopping amplitude should decay exponentially with
+distance. This function returns the data needed to check this behavior by plotting the
+hopping amplitudes as a function of distance.
+
+# Returns
+- `distances::Vector{Float64}`: Cartesian distances between orbital `i` at origin cell and orbital `j` at cell `R`.
+- `indices::Vector{Tuple{NTuple{3, Int}, Int, Int}}`: `(R, i, j)` triplets identifying each hopping.
+- `values::Vector{Float64}`: `|hopping|` amplitudes (already degeneracy-divided).
+
+# Example
+```julia
+using Plots
+dists, idxs, vals = distancehamiltonian(ham, lattice, centers)
+scatter(dists, log.(vals); xlabel="Distance (Å)", ylabel="log|hopping|", legend=false)
+savefig("hopping_decay.pdf")
+```
+"""
+function distancehamiltonian(ham::StaticGenerator{OperatorSum{W90Hoppings, NTuple{3, Int}}}, lattice::Lattice, centers::Matrix{Float64})
+    n_wan = size(centers, 2)
+    vectors = lattice.vectors
+
+    total = n_wan * n_wan * length(ham.operators)
+    distances = Vector{Float64}(undef, total)
+    values = Vector{Float64}(undef, total)
+    indices = Vector{Tuple{NTuple{3, Int}, Int, Int}}(undef, total)
+
+    k = 1
+    for m in ham.operators
+        R = m.id
+        R_cart = mapreduce(*, +, vectors, R)
+
+        for j in 1:n_wan
+            cⱼ = SVector(centers[1, j], centers[2, j], centers[3, j])
+            for i in 1:n_wan
+                cᵢ = SVector(centers[1, i], centers[2, i], centers[3, i])
+                dist = norm(R_cart + cⱼ - cᵢ)
+
+                distances[k] = dist
+                values[k] = abs(m.value[i, j])
+                indices[k] = (R, i, j)
+                k += 1
+            end
+        end
+    end
+    return distances, indices, values
+end
+
+"""
+    choosehamiltonian(
+        path::AbstractString,
+        seedname::AbstractString;
+        name::Symbol=Symbol(seedname),
+        projection::Bool=true,
+        min_hopping_norm::Real=0.0,
+        max_hopping_norm::Union{Real, Nothing}=nothing,
+        max_distance::Union{Real, Nothing}=nothing,
+        min_distance::Union{Real, Nothing}=nothing
+    ) -> StaticGenerator{OperatorSum{W90Hoppings, NTuple{3, Int}}}
+
+Convenience method: read lattice, centers, and Hamiltonian from Wannier90 output files,
+then filter by hopping norm and distance thresholds.
+
+See also: [`choosehamiltonian`](@ref) for the direct-input version.
+"""
+function choosehamiltonian(
+    path::AbstractString,
+    seedname::AbstractString;
+    name::Symbol=Symbol(seedname),
+    projection::Bool=true,
+    min_hopping_norm::Real=0.0,
+    max_hopping_norm::Union{Real, Nothing}=nothing,
+    max_distance::Union{Real, Nothing}=nothing,
+    min_distance::Union{Real, Nothing}=nothing
+)
+    lattice = readlattice(path, seedname; name=name, projection=projection)
+    centers = readcenters(path, seedname)
+    ham = readhamiltonian(path, seedname)
+    return choosehamiltonian(ham, lattice, centers; min_hopping_norm, max_hopping_norm, max_distance, min_distance)
+end
+
+"""
+    distancehamiltonian(
+        path::AbstractString,
+        seedname::AbstractString;
+        name::Symbol=Symbol(seedname),
+        projection::Bool=true
+    ) -> (Vector{Float64}, Vector{Tuple{NTuple{3, Int}, Int, Int}}, Vector{Float64})
+
+Convenience method: read lattice, centers, and Hamiltonian from Wannier90 output files,
+then return all hopping terms with their Cartesian distances and indices.
+
+See also: [`distancehamiltonian`](@ref) for the direct-input version.
+"""
+function distancehamiltonian(path::AbstractString, seedname::AbstractString; name::Symbol=Symbol(seedname), projection::Bool=true)
+    lattice = readlattice(path, seedname; name=name, projection=projection)
+    centers = readcenters(path, seedname)
+    ham = readhamiltonian(path, seedname)
+    return distancehamiltonian(ham, lattice, centers)
+end
+
+"""
+    showhamiltonian(
+        io::IO,
+        ham::StaticGenerator{OperatorSum{W90Hoppings, NTuple{3, Int}}},
+        lattice::Lattice,
+        centers::Matrix{Float64},
+        nsublattice::Int
+    )
+
+    showhamiltonian(
+        ham::StaticGenerator{OperatorSum{W90Hoppings, NTuple{3, Int}}},
+        lattice::Lattice,
+        centers::Matrix{Float64},
+        nsublattice::Int
+    )
+
+    showhamiltonian(
+        filename::AbstractString,
+        ham::StaticGenerator{OperatorSum{W90Hoppings, NTuple{3, Int}}},
+        lattice::Lattice,
+        centers::Matrix{Float64},
+        nsublattice::Int
+    )
+
+Print the Wannier90 hopping Hamiltonian in a human-readable format.
+
+For each R-vector and each sublattice pair `(i, j)`, prints the Cartesian
+distance `norm(R_cart + centers[:, j₁] - centers[:, i₁])` between the first
+orbitals, followed by the corresponding `norbit × norbit` hopping sub-matrix.
+
+When `io` is omitted, prints to `stdout`.  When `filename` is provided,
+writes to the specified file.  `nsublattice` is the number of sublattices;
+each sublattice has `n_wan ÷ nsublattice` orbitals.
+"""
+function showhamiltonian(io::IO, ham::StaticGenerator{OperatorSum{W90Hoppings, NTuple{3, Int}}}, lattice::Lattice, centers::Matrix{Float64}, nsublattice::Int)
+    n_wan = size(centers, 2)
+    vectors = lattice.vectors
+    norbit = div(n_wan, nsublattice)
+
+    # ---------- header: lattice info ----------
+    println(io, "# ================================================================================")
+    println(io, "# Wannier90 Tight-Binding Hamiltonian")
+    println(io, "# ================================================================================")
+    println(io, "#")
+    println(io, "# Explanation:")
+    println(io, "#   R           = (n₁, n₂, n₃) : supercell translation vector in lattice-vector basis.")
+    println(io, "#                                R_cart = n₁·a₁ + n₂·a₂ + n₃·a₃")
+    println(io, "#   sublattice  = (si, sj)      : sublattice indices. Each sublattice spans $(norbit) orbital(s),")
+    println(io, "#                                so sublattice s starts at orbital index (s-1)×$(norbit)+1.")
+    println(io, "#   distance    = ∥R_cart + center_j - center_i∥  (Å)")
+    println(io, "#                                Cartesian distance between Wannier orbital i (origin cell)")
+    println(io, "#                                and orbital j (in cell R).")
+    println(io, "#   orbital hoppings matrix      = ⟨w_{i,0}|H|w_{j,R}⟩  for orbitals on the two sites.")
+    println(io, "#                                Each block is $(norbit)×$(norbit), i.e. hoppings among the orbitals")
+    println(io, "#                                belonging to the two sublattices.")
+    println(io, "#")
+    println(io, "# Lattice vectors (columns, Å):")
+    for (idx, a) in enumerate(vectors)
+        println(io, "#   a$idx = ($(a[1]), $(a[2]), $(a[3]))")
+    end
+    println(io, "#")
+    println(io, "# Wannier centers (orbitals × 3, Å):")
+    for w in 1:n_wan
+        println(io, "#   orbital $w @ ($(centers[1, w]), $(centers[2, w]), $(centers[3, w]))")
+    end
+    println(io, "#")
+    n_R = length(ham.operators)
+    println(io, "# Total Wannier orbitals = $n_wan, nsublattice = $nsublattice, norbit/sublattice = $norbit, R-vectors = $n_R")
+    println(io, "# Hopping entries follow below:")
+    println(io, "# ================================================================================")
+    println(io)
+
+    for m in ham.operators
+        R = m.id
+        R_cart = mapreduce(*, +, vectors, R)
+        println(io, "# --- R = ($(R[1]), $(R[2]), $(R[3])) ---")
+        for (sj, j) in enumerate(1:norbit:n_wan)
+            cⱼ = SVector(centers[1, j], centers[2, j], centers[3, j])
+            for (si, i) in enumerate(1:norbit:n_wan)
+                cᵢ = SVector(centers[1, i], centers[2, i], centers[3, i])
+                dist = norm(R_cart + cⱼ - cᵢ)
+                kind = (R == (0, 0, 0) && si == sj) ? "(on-site)" : "(hopping)"
+                println(io, "#   sublattice($si,$sj),  distance = $(round(dist, digits=4))  $kind")
+                show(io, MIME"text/plain"(), m.value[i:i+norbit-1, j:j+norbit-1])
+                println(io)
+                println(io)
+            end
+        end
+    end
+end
+showhamiltonian(ham::StaticGenerator{OperatorSum{W90Hoppings, NTuple{3, Int}}}, lattice::Lattice, centers::Matrix{Float64}, nsublattice::Int) = showhamiltonian(stdout, ham, lattice, centers, nsublattice)
+
+function showhamiltonian(filename::AbstractString, ham::StaticGenerator{OperatorSum{W90Hoppings, NTuple{3, Int}}}, lattice::Lattice, centers::Matrix{Float64}, nsublattice::Int)
+    open(filename, "w") do io
+        showhamiltonian(io, ham, lattice, centers, nsublattice)
+    end
+end
+
+
+"""
     W90Matrixization{V<:AbstractVector{<:Real}} <: Matrixization
 
 Matrixization of the Hamiltonian obtained from Wannier90.
@@ -283,6 +569,23 @@ function W90(path::AbstractString, seedname::AbstractString; name::Symbol=Symbol
     H = readhamiltonian(path, seedname)
     return W90(lattice, centers, H)
 end
+
+"""
+    showW90(io::IO, wan::W90, nsublattice::Int)
+
+    showW90(wan::W90, nsublattice::Int)
+
+    showW90(filename::AbstractString, wan::W90, nsublattice::Int)
+
+Print the Wannier90 hopping Hamiltonian stored in a `W90` system in a human-readable format.
+
+When `io` is omitted, prints to `stdout`.
+When `filename` is provided, writes to the specified file.
+`nsublattice` is the number of sublattices.
+"""
+showW90(io::IO, wan::W90, nsublattice::Int) = showhamiltonian(io, wan.H, wan.lattice, wan.centers, nsublattice)
+showW90(wan::W90, nsublattice::Int) = showhamiltonian(stdout, wan.H, wan.lattice, wan.centers, nsublattice)
+showW90(filename::AbstractString, wan::W90, nsublattice::Int) = showhamiltonian(filename, wan.H, wan.lattice, wan.centers, nsublattice)
 
 """
     readbands(path::AbstractString, seedname::AbstractString) -> Tuple{Vector{Float64}, Matrix{Float64}}
