@@ -7,14 +7,18 @@ export CompositeTBA, Quadratic, Quadraticization, SimpleTBA, TBA, TBAMatrix, TBA
 export BerryCurvature, BerryCurvatureData, DensityOfStates, DensityOfStatesData, EnergyBands, EnergyBandsData, FermiSurface, FermiSurfaceData, InelasticNeutronScatteringSpectra, InelasticNeutronScatteringSpectraData
 export BerryCurvatureMethod, Fukui, Kubo
 
-# Utilities (fermi_dirac, occupation, chemical_potential, etc.)
-include("Utilities.jl")
-export chemical_potential, fermi_dirac, occupation
-
 # Fitting parameters
 include("Fitting.jl")
 
 # Integration with Wannier90
 include("Wannier90.jl")
+
+# Utilities (fermi_dirac, occupation, chemical_potential, etc.)
+include("Utilities.jl")
+export chemical_potential, fermi_dirac, occupation
+
+# Bridge between the Wannier90 data and the operator generators used by
+# SecondOrderPerturbationTheory (`Wannier90SOPT.W90Bridge`, ...)
+include("Wannier90SOPT.jl")
 
 end # module

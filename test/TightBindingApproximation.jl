@@ -1,12 +1,13 @@
 using Artifacts
-using LinearAlgebra: Diagonal, Eigen, Hermitian, ishermitian
+using LinearAlgebra: Diagonal, Eigen, Hermitian, I, eigvals, exp, ishermitian, kron
 using Pkg
-using QuantumLattices: Algorithm, BrillouinZone, Elastic, Fock, Formula, Generator, Hilbert, Hooke, Hopping, Kinetic, Lattice, Metric, Onsite, OperatorGenerator, OperatorSum, OperatorIndexToTuple, Pairing, Parameters, Phonon, ReciprocalPath, ReciprocalZone, Table
-using QuantumLattices: atol, σᶻ, 𝕕, 𝕕𝕕, 𝕕⁺𝕕, 𝕡, 𝕦, azimuth, bonds, dimension, distance, expand, getcontent, kind, matrix, parameternames, reciprocals, rcoordinate, scalartype, update!, @rectangle_str
+using QuantumLattices: Algorithm, BrillouinZone, Elastic, Fock, Formula, Generator, Hilbert, Hooke, Hopping, Kinetic, Lattice, Metric, Onsite, OperatorGenerator, OperatorSum, OperatorIndexToTuple, Pairing, Parameters, Phonon, ReciprocalPath, ReciprocalZone, StaticGenerator, Table
+using QuantumLattices: atol, σᶻ, 𝕕, 𝕕𝕕, 𝕕⁺𝕕, 𝕡, 𝕦, azimuth, bonds, decompose, dimension, distance, expand, getcontent, id, icoordinate, kind, matrix, parameternames, reciprocals, rcoordinate, scalartype, update!, value, @rectangle_str
 using StaticArrays: SVector
 using TightBindingApproximation
 using TightBindingApproximation.Fitting
 using TightBindingApproximation.Wannier90
+using TightBindingApproximation.Wannier90SOPT
 import CairoMakie as Makie
 import Plots
 
@@ -477,6 +478,64 @@ const dir = Pkg.Artifacts.ensure_artifact_installed("WannierDataSets", toml)
         end
     end
 
+    @testset "foldcenters" begin
+        lat = Lattice((0.0, 0.0, 0.0); name = :chain,
+                      vectors = [[2.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]])
+        centers = [0.0 1.0 -2.0 2.0 3.0; zeros(1, 5); zeros(1, 5)]
+        folded = foldcenters(centers, lat)
+        @test folded isa Matrix{Float64}
+        @test size(folded) == size(centers)
+        @test folded[1, :] ≈ [0.0, 1.0, 0.0, 0.0, 1.0]
+        @test foldcenters(folded, lat) ≈ folded
+        # a centre exactly on the cell boundary is folded to zero, not kept at the boundary
+        @test foldcenters(reshape([2.0 - 1e-12, 0.0, 0.0], 3, 1), lat)[1, 1] ≈ 0.0 atol = 1e-9
+        # centres already inside the first cell are unchanged
+        @test foldcenters(reshape([1.0, 0.0, 0.0], 3, 1), lat) ≈ reshape([1.0, 0.0, 0.0], 3, 1)
+        @test all(0.0 .<= [decompose(folded[:, i], lat.vectors)[1] for i in 1:size(folded, 2)] .< 1.0)
+        @test_throws ErrorException foldcenters(zeros(2, 3), lat)
+
+        # an unfolded centre shifts the hopping distance by a lattice vector
+        ham = OperatorSum{W90Hoppings}()
+        value0 = ComplexF64[0.0 1.0; 1.0 0.0]
+        ham.contents[(0, 0, 0)] = W90Hoppings(copy(value0), (0, 0, 0))
+        ham.contents[(1, 0, 0)] = W90Hoppings(zeros(ComplexF64, 2, 2), (1, 0, 0))
+        ham.contents[(-1, 0, 0)] = W90Hoppings(zeros(ComplexF64, 2, 2), (-1, 0, 0))
+        hamc = StaticGenerator(ham)
+        centers = [0.0 2.0; zeros(1, 2); zeros(1, 2)]   # orbital 2 is one vector away, i.e. at the same site
+        # folding makes the (i, j) = (1, 2) hopping onsite and keeps it below the cutoff
+        @test choosehamiltonian(hamc, lat, centers; max_distance = 0.5).operators.contents[(0, 0, 0)].value ≈ value0
+        @test iszero(maximum(abs, choosehamiltonian(hamc, lat, centers; max_distance = 0.5, fold = false).operators.contents[(0, 0, 0)].value))
+        dists1, idxs1, _ = distancehamiltonian(hamc, lat, centers; fold = true)
+        dists2, idxs2, _ = distancehamiltonian(hamc, lat, centers; fold = false)
+        pos1 = findfirst(idx -> idx == ((0, 0, 0), 1, 2), idxs1)
+        pos2 = findfirst(idx -> idx == ((0, 0, 0), 1, 2), idxs2)
+        @test dists1[pos1] ≈ 0.0 atol = 1e-10
+        @test dists2[pos2] ≈ 2.0 atol = 1e-10
+        # the read-back centres of a Wannier90 run may be outside the first cell
+        foldedwan = foldcenters(wan.frontend.centers, wan.frontend.lattice)
+        @test all(-1e-6 .<= decompose(foldedwan[:, i], wan.frontend.lattice.vectors)[k] .< 1.0
+                  for i in 1:size(foldedwan, 2), k in 1:3)
+        # folding an atom position only shifts it by a lattice vector, so it stays an
+        # equivalent position even when it starts inside the Wigner-Seitz cell
+        latwan = wan.frontend.lattice
+        foldedlat = foldcenters(latwan.coordinates, latwan)
+        fracshift(c, i) = decompose(foldedlat[:, i] - latwan.coordinates[:, i], latwan.vectors)[c]
+        @test all(abs(fracshift(k, i) - round(fracshift(k, i))) < 1e-6
+                  for i in 1:size(latwan.coordinates, 2), k in 1:3)
+        @test foldcenters(foldedlat, latwan) ≈ foldedlat
+
+        # `W90(path, seedname)` folds by default, `fold = false` keeps the file values
+        wanraw = W90(dir, "silicon"; fold = false)
+        @test wanraw.centers ≠ wan.frontend.centers
+        @test foldcenters(wanraw.centers, wanraw.lattice) ≈ wan.frontend.centers
+        # folding only changes the gauge of `:rcoordinate`, never the eigenvalues
+        kk = [0.13, 0.21, -0.07]
+        @test Matrix(matrix(wanraw, kk; gauge = :icoordinate).H) ==
+              Matrix(matrix(wan.frontend, kk; gauge = :icoordinate).H)
+        @test eigvals(Hermitian(Matrix(matrix(wanraw, kk; gauge = :rcoordinate).H))) ≈
+              eigvals(Hermitian(Matrix(matrix(wan.frontend, kk; gauge = :rcoordinate).H)))
+    end
+
     @testset "showhamiltonian" begin
         ham = wan.frontend.H
         lat = wan.frontend.lattice
@@ -487,16 +546,30 @@ const dir = Pkg.Artifacts.ensure_artifact_installed("WannierDataSets", toml)
         showhamiltonian(io, ham, lat, cnt, nsublattice)
         output = String(take!(io))
         @test length(output) > 0
-        @test occursin(", distance=", output)
-        @test occursin("R=(", output)
+        @test occursin("sublattice(", output)
+        @test occursin("distance = ", output)
 
         # Write to file
         tmpfile = tempname() * ".txt"
         showhamiltonian(tmpfile, ham, lat, cnt, nsublattice)
         @test isfile(tmpfile)
         file_output = read(tmpfile, String)
-        @test occursin(", distance=", file_output)
+        @test occursin("sublattice(", file_output)
         rm(tmpfile)
+
+        # `digits` rounds the matrix elements and keeps the standard display
+        io = IOBuffer()
+        showhamiltonian(io, ham, lat, cnt, nsublattice; digits = 4)
+        @test occursin("Matrix{ComplexF64}", String(take!(io)))
+        @test_throws ErrorException showhamiltonian(IOBuffer(), ham, lat, cnt, nsublattice; digits = -1)
+
+        # `fold` decides whether the printed centres and distances use the folded coordinates
+        cntraw = W90(dir, "silicon"; fold = false).centers
+        @test cntraw ≠ cnt
+        showhamiltonian(io, ham, lat, cntraw, nsublattice)
+        @test String(take!(io)) == output                       # folding restores the same text
+        showhamiltonian(io, ham, lat, cntraw, nsublattice; fold = false)
+        @test String(take!(io)) ≠ output
     end
 
     @testset "showW90" begin
@@ -505,13 +578,410 @@ const dir = Pkg.Artifacts.ensure_artifact_installed("WannierDataSets", toml)
         showW90(io, wan.frontend, nsublattice)
         output = String(take!(io))
         @test length(output) > 0
-        @test occursin(", distance=", output)
+        @test occursin("sublattice(", output)
 
         tmpfile = tempname() * ".txt"
         showW90(tmpfile, wan.frontend, nsublattice)
         @test isfile(tmpfile)
         file_output = read(tmpfile, String)
-        @test occursin(", distance=", file_output)
+        @test occursin("sublattice(", file_output)
         rm(tmpfile)
+
+        # the store of a `fold = false` system keeps the file values; folding on print
+        # restores exactly the text above, and `fold = false` prints the file values
+        wanraw = W90(dir, "silicon"; fold = false)
+        io = IOBuffer()
+        showW90(io, wanraw, nsublattice)
+        @test String(take!(io)) == output
+        showW90(io, wanraw, nsublattice; fold = false)
+        @test String(take!(io)) ≠ output
+    end
+
+    @testset "showhamiltonian (SOC)" begin
+        # synthetic spinor data: 2 sites x 1 orbital x 2 spins, stored in the
+        # Wannier90 order ↑o₁, ↓o₁, ↑o₂, ↓o₂ (site 1 = 1:2, site 2 = 3:4)
+        lat = Lattice((0.0, 0.0, 0.0), (1.0, 0.0, 0.0); name = :chain,
+                      vectors = [[2.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]])
+        cnt = [0.0 0.0 1.0 1.0;
+               0.0 0.0 0.0 0.0;
+               0.0 0.0 0.0 0.0]
+        M0 = ComplexF64[1.0 0.2im 0.3 0.0;
+                        -0.2im 0.9 0.1im 0.2;
+                        0.3 -0.1im 0.8 0.15im;
+                        0.0 0.2 -0.15im 0.7]
+        M0 = (M0 + M0') / 2
+        M1 = zeros(ComplexF64, 4, 4)
+        M1[3:4, 1:2] = [0.25 0.1im; -0.1im 0.15]
+        hop = OperatorSum{W90Hoppings}()
+        hop.contents[(0, 0, 0)] = W90Hoppings(M0, (0, 0, 0))
+        hop.contents[(1, 0, 0)] = W90Hoppings(M1, (1, 0, 0))
+        hop.contents[(-1, 0, 0)] = W90Hoppings(M1', (-1, 0, 0))
+        wanSpinor = W90(lat, cnt, StaticGenerator(hop))
+
+        io = IOBuffer()
+        showhamiltonian(io, wanSpinor.H, wanSpinor.lattice, wanSpinor.centers, 2; spinors = true)
+        output = String(take!(io))
+        @test occursin("spin-orbit coupling", output)
+        @test occursin("↑o₁, ↓o₁", output)
+        @test occursin("norbit/sublattice = 1, spins = 2", output)
+        @test count(line -> occursin("sublattice(", line), split(output, '\n')) ==
+              2^2 * length(wanSpinor.H.operators)
+
+        # the Wannier90 spinor order is kept: the printed 2×2 blocks are the raw blocks
+        @test occursin("1.0+0.0im", output)        # block (0,0,0)[1:2, 1:2]
+        @test occursin("0.0+0.2im", output)
+        @test occursin("0.0-0.2im", output)
+        @test occursin("0.25+0.0im", output)       # block (1,0,0)[3:4, 1:2]
+        @test occursin("0.0+0.1im", output)
+
+        # showW90 forwards to the same printer
+        io2 = IOBuffer()
+        showW90(io2, wanSpinor, 2; spinors = true)
+        @test String(take!(io2)) == output
+
+        # the filename variant writes the same text
+        tmpfile = tempname() * ".txt"
+        showhamiltonian(tmpfile, wanSpinor.H, wanSpinor.lattice, wanSpinor.centers, 2; spinors = true)
+        @test isfile(tmpfile)
+        @test read(tmpfile, String) == output
+        rm(tmpfile)
+
+        # without `spinors` the same data are printed by the spinless path
+        io3 = IOBuffer()
+        showhamiltonian(io3, wanSpinor.H, wanSpinor.lattice, wanSpinor.centers, 2)
+        output3 = String(take!(io3))
+        @test !occursin("spin-orbit coupling", output3)
+        @test !occursin("spin order", output3)
+        @test occursin("norbit/sublattice = 2, R-vectors", output3)
+
+        # 4 Wannier functions cannot be split into spinor pairs on 3 sublattices
+        @test_throws ErrorException showhamiltonian(IOBuffer(), wanSpinor.H, wanSpinor.lattice,
+                                                    wanSpinor.centers, 3; spinors = true)
+
+        # `digits` keeps the significant digits, adds no trailing zeros
+        io4 = IOBuffer()
+        showhamiltonian(io4, wanSpinor.H, wanSpinor.lattice, wanSpinor.centers, 2; spinors = true, digits = 8)
+        output4 = String(take!(io4))
+        @test occursin("1.0+0.0im", output4)
+        @test occursin("0.0+0.2im", output4)
+        @test occursin("0.0-0.2im", output4)
+        @test !occursin("1.00000000", output4)
+        @test occursin("Matrix{ComplexF64}", output4)
+        io5 = IOBuffer()
+        showW90(io5, wanSpinor, 2; spinors = true, digits = 8)
+        @test String(take!(io5)) == output4
+
+        # all the digits of the stored data survive, binary noise is removed
+        Mnoisy = copy(M0)
+        Mnoisy[1, 1] = 0.1 + 0.2                     # 0.30000000000000004
+        Mnoisy[2, 2] = 4.91394713456
+        hopnoisy = OperatorSum{W90Hoppings}()
+        hopnoisy.contents[(0, 0, 0)] = W90Hoppings(Mnoisy, (0, 0, 0))
+        wannoise = W90(lat, cnt, StaticGenerator(hopnoisy))
+        io6 = IOBuffer()
+        showhamiltonian(io6, wannoise.H, wannoise.lattice, wannoise.centers, 2; spinors = true, digits = 16)
+        output6 = String(take!(io6))
+        @test occursin("0.3+0.0im", output6)
+        @test !occursin("0.30000000000000004", output6)
+        @test occursin("4.91394713456+0.0im", output6)
+
+        # without `digits` every stored digit is printed, at full precision
+        io7 = IOBuffer()
+        showhamiltonian(io7, wannoise.H, wannoise.lattice, wannoise.centers, 2; spinors = true)
+        output7 = String(take!(io7))
+        @test occursin("4.91394713456+0.0im", output7)
+        @test !occursin("4.91395+", output7)          # Julia's own display would shorten it
+        @test occursin("0.30000000000000004+0.0im", output7)
+        # `digits` is the number of significant digits: 1..17 only
+        @test_throws ErrorException showhamiltonian(IOBuffer(), wannoise.H, wannoise.lattice,
+                                                    wannoise.centers, 2; spinors = true, digits = 0)
+        @test_throws ErrorException showhamiltonian(IOBuffer(), wannoise.H, wannoise.lattice,
+                                                    wannoise.centers, 2; spinors = true, digits = 18)
+
+        @test_throws ErrorException showhamiltonian(IOBuffer(), wanSpinor.H, wanSpinor.lattice,
+                                                    wanSpinor.centers, 2; spinors = true, digits = -1)
+    end
+end
+
+@testset "gaugetransform and Wannier90SOPT" begin
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+    blochmatrix(wan, k; gauge = :icoordinate) = Matrix(matrix(wan, k; gauge = gauge).H)
+    spectrum(M) = sort(real.(eigvals(Hermitian(M))))
+    unitarydeviation(U) = maximum(abs.(U' * U - I))
+
+    """
+    orderedmatrix(hilbert, gens, k, keytowannier)
+
+    Bloch matrix of the operators of `gens` at `k`. With `keytowannier === nothing`
+    the result is in `Table` order `(site, orbital, spin)`; otherwise `keytowannier`
+    maps a table key `(site, orbital, spin)` to a Wannier index and the matrix is
+    reordered accordingly.
+    """
+    function orderedmatrix(hilbert, gens, k, keytowannier)
+        table = Table(hilbert, OperatorIndexToTuple(:site, :orbital, :spin))
+        tblkeys = collect(keys(table))
+        position = Dict{Any, Int}(key => index for (key, index) in pairs(table))
+        M = zeros(ComplexF64, length(tblkeys), length(tblkeys))
+        for gen in gens, op in expand(gen)
+            i1, i2 = id(op)[1], id(op)[2]
+            key1 = (i1.index.site, i1.index.internal.orbital, i1.index.internal.spin)
+            key2 = (i2.index.site, i2.index.internal.orbital, i2.index.internal.spin)
+            M[position[key1], position[key2]] += value(op) * exp(im * sum(k .* icoordinate(op)))
+        end
+        keytowannier === nothing && return M
+        permutation = Vector{Int}(undef, length(tblkeys))
+        for key in tblkeys
+            permutation[keytowannier(key)] = position[key]
+        end
+        return M[permutation, permutation]
+    end
+
+    # ------------------------------------------------------------------
+    # synthetic Wannier90 data: 2 sites x 2 orbitals, nearest-neighbour chain
+    # ------------------------------------------------------------------
+    lattice = Lattice((0.0, 0.0, 0.0), (1.0, 0.0, 0.0); name = :chain,
+                      vectors = [[2.0, 0.0, 0.0], [0.0, 10.0, 0.0], [0.0, 0.0, 10.0]])
+    norb, nsites = 2, length(lattice)
+    nwan = norb * nsites
+    centers = zeros(Float64, 3, nwan)
+    for site in 1:nsites, orbital in 1:norb
+        centers[:, (site - 1) * norb + orbital] = [site - 1.0, 0.0, 0.0]
+    end
+    M0 = zeros(ComplexF64, nwan, nwan)
+    M0[1:2, 1:2] = [1.0 0.2im; -0.2im -0.5]
+    M0[3:4, 3:4] = [0.8 0.15im; -0.15im -0.9]
+    M0[1:2, 3:4] = [0.3 0.0; 0.1im 0.2]
+    M0[3:4, 1:2] = M0[1:2, 3:4]'
+    M1 = zeros(ComplexF64, nwan, nwan)
+    M1[3:4, 1:2] = [-0.3 0.1; 0.4 -0.25]
+    ham = OperatorSum{W90Hoppings}()
+    ham.contents[(0, 0, 0)] = W90Hoppings((M0 + M0') / 2, (0, 0, 0))
+    ham.contents[(1, 0, 0)] = W90Hoppings(M1, (1, 0, 0))
+    ham.contents[(-1, 0, 0)] = W90Hoppings(M1', (-1, 0, 0))
+    wan = W90(lattice, centers, StaticGenerator(ham))
+
+    snapshot = Dict(R => copy(hop.value) for (R, hop) in wan.H.operators.contents)
+    centers0 = copy(wan.centers)
+    ks = ([0.0, 0.0, 0.0], [0.3, 0.0, 0.0], [0.7, 0.2, 0.1], [1.1, 0.0, 0.0])
+
+    # deterministic unitary rotations
+    θ = 0.4
+    R1 = ComplexF64[cos(θ) -sin(θ); sin(θ) cos(θ)]
+    φ = 0.3
+    R2 = ComplexF64[0 exp(im * φ); exp(-im * φ) 0]
+    A = ComplexF64[0.2 0.1+0.3im 0.0 0.2;
+                   0.1-0.3im -0.4 0.5im 0.0;
+                   0.0 -0.5im 0.7 0.1;
+                   0.2 0.0 0.1 -0.1]
+    A = (A + A') / 2
+    U = exp(im * A)
+    @test unitarydeviation(U) < 1e-12
+    @test unitarydeviation(R1) < 1e-12
+    @test unitarydeviation(R2) < 1e-12
+
+    # ==================================================================
+    @testset "gaugetransform: full unitary" begin
+        wanU = gaugetransform(wan, U)
+        @test wanU !== wan
+        @test wanU.centers == wan.centers
+        @test wanU.centers !== wan.centers
+        for (R, hop) in wan.H.operators.contents
+            @test wanU.H.operators.contents[R].value !== hop.value
+            @test hop.value == snapshot[R]
+        end
+        @test wan.centers == centers0
+        for k in ks
+            @test blochmatrix(wanU, k) ≈ U' * blochmatrix(wan, k) * U
+            @test spectrum(blochmatrix(wanU, k)) ≈ spectrum(blochmatrix(wan, k)) atol = 1e-10
+        end
+
+        @test_throws ErrorException gaugetransform(wan, zeros(ComplexF64, nwan, nwan))
+        @test_throws ErrorException gaugetransform(wan, 2 .* U)
+        @test_throws ErrorException gaugetransform(wan, zeros(ComplexF64, nwan, nwan + 1))
+        # without the unitarity check a general congruence is accepted
+        @test gaugetransform(wan, 2 .* U; checkunitary = false) isa W90
+    end
+
+    # ==================================================================
+    @testset "gaugetransform: per site" begin
+        siteindices = Dict(1 => [1, 2], 2 => [3, 4])
+        rotations = Dict(1 => R1, 2 => R2)
+        Ublock = zeros(ComplexF64, nwan, nwan)
+        Ublock[1:2, 1:2] = R1
+        Ublock[3:4, 3:4] = R2
+
+        wanP = gaugetransform(wan, siteindices, rotations)
+        wanF = gaugetransform(wan, siteindices, site -> rotations[site])
+        wanM = gaugetransform(wan, Ublock)
+        for R in keys(snapshot)
+            @test wanP.H.operators.contents[R].value ≈ wanM.H.operators.contents[R].value
+            @test wanF.H.operators.contents[R].value ≈ wanM.H.operators.contents[R].value
+            @test wanP.H.operators.contents[R].value ≈ Ublock' * snapshot[R] * Ublock
+        end
+        for k in ks
+            @test blochmatrix(wanP, k) ≈ Ublock' * blochmatrix(wan, k) * Ublock
+            # all Wannier functions of a site share one centre -> exact for :rcoordinate
+            @test blochmatrix(wanP, k; gauge = :rcoordinate) ≈
+                  Ublock' * blochmatrix(wan, k; gauge = :rcoordinate) * Ublock
+        end
+
+        # sites without a rotation keep the identity
+        wanPart = gaugetransform(wan, siteindices, Dict(1 => R1))
+        Upart = Matrix{ComplexF64}(I, nwan, nwan)
+        Upart[1:2, 1:2] = R1
+        for k in ks
+            @test blochmatrix(wanPart, k) ≈ Upart' * blochmatrix(wan, k) * Upart
+        end
+
+        @test_throws ErrorException gaugetransform(wan, siteindices, Dict(1 => R1, 5 => R2))
+        @test_throws ErrorException gaugetransform(wan, Dict(1 => [1, 2], 2 => [3, 3]), rotations)
+        @test_throws ErrorException gaugetransform(wan, Dict(1 => [1, 2], 2 => [3, 5]), rotations)
+        @test_throws ErrorException gaugetransform(wan, Dict(1 => [1, 2], 2 => [3]), rotations)
+        @test_throws ErrorException gaugetransform(wan, Dict(1 => Set([1, 2]), 2 => [3, 4]), rotations)
+        @test_throws ErrorException gaugetransform(wan, siteindices, Dict(1 => rand(3, 3), 2 => R2))
+        @test_throws ErrorException gaugetransform(wan, siteindices, Dict(1 => 1.0im, 2 => R2))
+    end
+
+    # ==================================================================
+    @testset "W90Bridge" begin
+        # the Hilbert space must be spinful: the spinless Wannier data are
+        # duplicated onto both spin sectors, i.e. H = H_W90 ⊗ I₂
+        hilbert = Hilbert(pid => Fock{:f}(norb, 2) for pid in 1:nsites)
+        bridge = W90Bridge(wan, hilbert)
+        @test bridge.siteindices == Dict(1 => [1, 2], 2 => [3, 4])
+        @test bridge.w90index == [(1, 1), (1, 2), (2, 1), (2, 2)]
+
+        shells = w90shells(bridge; n = 1)
+        @test ((1, 0, 0), [1]) in shells
+        @test ((-1, 0, 0), [1]) in shells
+        coverage = w90coverage(bridge, bonds(lattice, 1))
+        @test coverage.n_missing == 0
+
+        # the Table order is (site, orbital, spin), spin fastest, so the Wannier
+        # index w of a spin-up entry maps to 2w-1 and of a spin-down entry to 2w
+        H0, H1 = w90generators(bridge; neighbors = 1)
+        lookup = Dict(bridge.w90index[w] => w for w in eachindex(bridge.w90index))
+        keytowannier = key -> 2 * lookup[(key[1], key[2])] - (key[3] == 1//2 ? 1 : 0)
+        for k in ks
+            @test orderedmatrix(hilbert, (H0, H1), k, keytowannier) ≈
+                  kron(blochmatrix(wan, k), Matrix{ComplexF64}(I, 2, 2))
+        end
+
+        # a spinless Hilbert space is not supported
+        hilbert0 = Hilbert(pid => Fock{:f}(norb, 1) for pid in 1:nsites)
+        @test_throws "the Hilbert space must be spinful" W90Bridge(wan, hilbert0)
+        # `siteindices` must use each Wannier index exactly once ...
+        @test_throws "must contain each Wannier index" W90Bridge(
+            wan, hilbert; siteindices = Dict(1 => [1, 1], 2 => [3, 4])
+        )
+        # ... and must give one Wannier index per orbital of the site
+        @test_throws "but 1 Wannier indices were given" W90Bridge(
+            wan, hilbert; siteindices = Dict(1 => [1], 2 => [3, 4])
+        )
+
+        # the bridge convenience of gaugetransform uses `bridge.siteindices`
+        rotations = Dict(1 => R1, 2 => R2)
+        Ublock = zeros(ComplexF64, nwan, nwan)
+        Ublock[1:2, 1:2] = R1
+        Ublock[3:4, 3:4] = R2
+        wanB = gaugetransform(bridge, rotations)
+        for k in ks
+            @test blochmatrix(wanB, k) ≈ Ublock' * blochmatrix(wan, k) * Ublock
+        end
+        @test blochmatrix(gaugetransform(bridge, Ublock), ks[2]) ≈
+              Ublock' * blochmatrix(wan, ks[2]) * Ublock
+
+        # a bridge rebuilt from the rotated data reproduces the rotated Hamiltonian
+        bridgeB = W90Bridge(wanB, hilbert)
+        H0b, H1b = w90generators(bridgeB; neighbors = 1)
+        for k in ks
+            @test orderedmatrix(hilbert, (H0b, H1b), k, nothing) ≈
+                  kron(blochmatrix(wanB, k), Matrix{ComplexF64}(I, 2, 2))
+        end
+    end
+
+    # ==================================================================
+    @testset "W90SpinorBridge" begin
+        nwanS = 2 * norb * nsites
+        centersS = zeros(Float64, 3, nwanS)
+        for site in 1:nsites, orbital in 1:norb, slot in 1:2
+            w = 4 * (site - 1) + 2 * (orbital - 1) + slot
+            centersS[:, w] = [site - 1.0, 0.0, 0.0]
+        end
+
+        state = Ref{UInt64}(12345)
+        nextvalue() = begin
+            state[] = state[] * UInt64(6364136223846793005) + UInt64(1442695040888963407)
+            return Float64(state[] % UInt64(10000)) / 10000.0
+        end
+        randblock(scale) = ComplexF64[
+            scale * (0.1 * (nextvalue() - 0.5) + 0.1im * (nextvalue() - 0.5)) for _ in 1:nwanS, _ in 1:nwanS
+        ]
+        S0 = randblock(1.0)
+        S0 = (S0 + S0') / 2
+        for i in 1:nwanS
+            S0[i, i] += 0.5 + 0.1im
+        end
+        S1 = randblock(0.3)             # only site 2 <- site 1
+        S1[1:4, :] .= 0
+        S1[:, 5:8] .= 0
+
+        hamS = OperatorSum{W90Hoppings}()
+        hamS.contents[(0, 0, 0)] = W90Hoppings(S0, (0, 0, 0))
+        hamS.contents[(1, 0, 0)] = W90Hoppings(S1, (1, 0, 0))
+        hamS.contents[(-1, 0, 0)] = W90Hoppings(S1', (-1, 0, 0))
+        wanS = W90(lattice, centersS, StaticGenerator(hamS))
+
+        hilbertS = Hilbert(pid => Fock{:f}(norb, 2) for pid in 1:nsites)
+        bridgeS = W90SpinorBridge(wanS, hilbertS)
+        @test bridgeS.siteindices == Dict(1 => [1, 2, 3, 4], 2 => [5, 6, 7, 8])
+        @test bridgeS.w90index[[1, 2, 3, 4]] ==
+              [(1, 1, 1//2), (1, 1, -1//2), (1, 2, 1//2), (1, 2, -1//2)]
+        @test w90coverage(bridgeS, bonds(lattice, 1)).n_missing == 0
+        @test ((1, 0, 0), [1]) in w90shells(bridgeS; n = 1)
+
+        keytowannier = key -> Dict(bridgeS.w90index[w] => w for w in 1:nwanS)[key]
+        H0S, H1S = w90spinorgenerators(bridgeS; neighbors = 1)
+        for k in ks
+            @test orderedmatrix(hilbertS, (H0S, H1S), k, keytowannier) ≈ blochmatrix(wanS, k)
+        end
+        # spinor bands are not duplicated
+        @test length(unique(round.(real.(spectrum(blochmatrix(wanS, ks[2]))); digits = 8))) == nwanS
+
+        # slot-preserving rotation: orbital mixing without spin mixing
+        Rsp = ComplexF64[cos(θ) -sin(θ); sin(θ) cos(θ)]
+        Rsite = kron(Rsp, Matrix{ComplexF64}(I, 2, 2))
+        rotationsS = Dict(site => Rsite for site in keys(bridgeS.siteindices))
+        wanS2 = gaugetransform(wanS, bridgeS.siteindices, rotationsS)
+        US = zeros(ComplexF64, nwanS, nwanS)
+        for (_, indices) in bridgeS.siteindices
+            US[indices, indices] = Rsite
+        end
+        for k in ks
+            @test blochmatrix(wanS2, k) ≈ US' * blochmatrix(wanS, k) * US
+        end
+        bridgeS2 = W90SpinorBridge(wanS2, hilbertS)
+        @test bridgeS2.siteindices == bridgeS.siteindices
+        @test [entry[3] for entry in bridgeS2.w90index] == [entry[3] for entry in bridgeS.w90index]
+        H0S2, H1S2 = w90spinorgenerators(bridgeS2; neighbors = 1)
+        for k in ks
+            @test orderedmatrix(hilbertS, (H0S2, H1S2), k, keytowannier) ≈ blochmatrix(wanS2, k)
+        end
+
+        # a spin-mixing rotation keeps the matrix relation but invalidates the spin labels
+        Rmix = ComplexF64[0 1 0 0; 1 0 0 0; 0 0 1 0; 0 0 0 1]
+        wanS3 = gaugetransform(wanS, bridgeS.siteindices, Dict(1 => Rmix))
+        U3 = Matrix{ComplexF64}(I, nwanS, nwanS)
+        U3[1:4, 1:4] = Rmix
+        for k in ks
+            @test blochmatrix(wanS3, k) ≈ U3' * blochmatrix(wanS, k) * U3
+        end
+
+        @test_throws ErrorException W90SpinorBridge(wanS, Hilbert(pid => Fock{:f}(norb, 1) for pid in 1:nsites))
+        @test_throws ErrorException W90SpinorBridge(wanS, hilbertS;
+                                                    siteindices = Dict(1 => [1, 2, 3, 4], 2 => [5, 6, 7, 7]))
+        @test_throws ErrorException W90SpinorBridge(wanS, Hilbert(pid => Fock{:f}(2 * norb, 2) for pid in 1:nsites))
     end
 end
