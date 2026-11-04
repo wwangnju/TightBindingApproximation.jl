@@ -181,7 +181,6 @@ Both accept a `W90Bridge` and a `W90SpinorBridge`.
 module Wannier90SOPT
 
 using ..Wannier90
-import ..Wannier90: gaugetransform
 using QuantumLattices
 
 export W90Bridge, W90SpinorBridge, integerR,
@@ -962,58 +961,6 @@ function w90coverage(bridge::W90SpinorBridge, bs; onsite::Bool = true, tol::Real
         end
     end
     return (; covered, missing, n_missing = length(missing))
-end
-
-# ---------------------------------------------------------------------------
-# Wannier-gauge transformation (extension of gaugetransform)
-# ---------------------------------------------------------------------------
-
-"""
-    gaugetransform(bridge::Union{W90Bridge, W90SpinorBridge}, rotations; kwargs...) -> W90
-
-Rotate the Wannier gauge of `bridge.data` with a site-local unitary and return
-the new `W90`.
-
-`rotations` is either a dictionary `site => local unitary` or a function
-`site -> local unitary`; the per-site Wannier index order is `bridge.siteindices`,
-so the `j`-th row and column of `rotations[site]` refer to
-`bridge.siteindices[site][j]`. Every `H(R)` block is transformed in one call, so
-the data stay in a single Wannier gauge.
-
-The bridge itself is **not** updated: `bridge.blocks` is a snapshot taken when the
-bridge was constructed. Rebuild the bridge from the returned `W90` before calling
-`w90generators` or `w90spinorgenerators`:
-
-    wan′    = gaugetransform(bridge, rotations)
-    bridge′ = W90Bridge(wan′, bridge.hilbert)          # or W90SpinorBridge
-    H₀, H₁  = w90generators(bridge′; ...)
-
-For a `W90SpinorBridge`, only rotations that preserve the spin slot of every
-Wannier index are compatible with the spin labels stored in `bridge.w90index`
-and with the slot decomposition used by the operator generator; in the default
-`orbital1↑, orbital1↓, orbital2↑, ...` order that means `kron(R, I₂)`. A rotation
-that mixes spin-up and spin-down still yields the correct matrix relation
-`matrix(wan′, k) = U' * matrix(wan, k) * U`, but the Wannier functions are no
-longer spin eigenstates, so the spin labels and the spin-resolved coupling
-decomposition no longer carry their original meaning.
-
-See `TightBindingApproximation.Wannier90.gaugetransform` for the conventions,
-the unitarity check, the treatment of the Wannier centres and the interaction
-terms.
-"""
-function gaugetransform(
-        bridge::Union{W90Bridge, W90SpinorBridge},
-        rotations::Union{AbstractDict, Function};
-        kwargs...)
-    return gaugetransform(
-        bridge.data, bridge.siteindices, rotations; kwargs...)
-end
-
-function gaugetransform(
-        bridge::Union{W90Bridge, W90SpinorBridge},
-        U::AbstractMatrix{<:Number};
-        kwargs...)
-    return gaugetransform(bridge.data, U; kwargs...)
 end
 
 end # module

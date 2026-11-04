@@ -881,20 +881,24 @@ end
             wan, hilbert; siteindices = Dict(1 => [1], 2 => [3, 4])
         )
 
-        # the bridge convenience of gaugetransform uses `bridge.siteindices`
+        # rotate through the W90 API, then rebuild the bridge from the rotated
+        # data: a bridge is a derived mapping and is not transformed itself
         rotations = Dict(1 => R1, 2 => R2)
         Ublock = zeros(ComplexF64, nwan, nwan)
         Ublock[1:2, 1:2] = R1
         Ublock[3:4, 3:4] = R2
-        wanB = gaugetransform(bridge, rotations)
+        wanB = gaugetransform(wan, bridge.siteindices, rotations)
         for k in ks
             @test blochmatrix(wanB, k) ≈ Ublock' * blochmatrix(wan, k) * Ublock
         end
-        @test blochmatrix(gaugetransform(bridge, Ublock), ks[2]) ≈
+        @test blochmatrix(gaugetransform(wan, Ublock), ks[2]) ≈
               Ublock' * blochmatrix(wan, ks[2]) * Ublock
+        @test blochmatrix(gaugetransform(wan, bridge.siteindices, site -> rotations[site]), ks[2]) ≈
+              blochmatrix(wanB, ks[2])
 
-        # a bridge rebuilt from the rotated data reproduces the rotated Hamiltonian
+        # the rebuilt bridge reproduces the rotated Hamiltonian
         bridgeB = W90Bridge(wanB, hilbert)
+        @test bridgeB.siteindices == bridge.siteindices
         H0b, H1b = w90generators(bridgeB; neighbors = 1)
         for k in ks
             @test orderedmatrix(hilbert, (H0b, H1b), k, nothing) ≈

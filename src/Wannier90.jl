@@ -998,8 +998,7 @@ orbitals, the interaction tensors must be transformed separately.
   centres are kept, `M′_rco = U' M_rco U` holds exactly only when `U` commutes
   with `diag(exp(im .* (k ⋅ c)))` on every rotated block.
 
-See `gaugetransform(wan, siteindices, rotations)` for the per-site form. The
-`Wannier90SOPT` bridges provide `gaugetransform(bridge, rotations)`.
+See `gaugetransform(wan, siteindices, rotations)` for the per-site form.
 """
 function gaugetransform(wan::W90, U::AbstractMatrix{<:Number};
                         atol::Real = 1e-8, checkunitary::Bool = true)
@@ -1051,7 +1050,7 @@ If `rotations` is a function instead of a dictionary, it is called as
 identity for the sites that should stay unchanged.
 """
 function gaugetransform(wan::W90, siteindices::AbstractDict, rotations::AbstractDict;
-                        atol::Real = 1e-8, checkunitary::Bool = true)
+                        atol::Real = 1e-13, checkunitary::Bool = true)
     n = dimension(wan)
     used = falses(n)
     blocks = Tuple{Vector{Int}, Matrix{ComplexF64}}[]
